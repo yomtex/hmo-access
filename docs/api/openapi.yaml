@@ -1,0 +1,1170 @@
+openapi: 3.1.0
+info:
+  title: HMO Access API
+  version: 1.0.0-mvp
+  description: |
+    Versioned REST API for HMO Access — multi-HMO benefits verification, authorization and provider settlement.
+
+    **Status: development MVP.** Not deployed to production; no HMO or provider is integrated yet.
+
+    Authentication: `Authorization: Bearer <token>` (from `POST /v1/auth/login`) or the `hmoa_session`
+    HttpOnly cookie set by the same call. Cookie-authenticated writes must be same-origin (`Origin` header
+    must match `Host`), otherwise `403 CSRF_REJECTED`.
+
+    Tenancy: every request acts for the caller's *active organization*. Objects belonging to other
+    organizations are reported as `404 NOT_FOUND` (never `403`) to avoid confirming their existence.
+
+    Money is always an integer of minor units (`*Minor`, kobo for NGN) plus an ISO-4217 `currency`.
+
+    Permissions are listed per operation as `x-permission`; the role matrix lives in
+    `src/lib/server/auth/permissions.ts` and docs/api/api-specification.md.
+servers:
+  - url: http://localhost:3000
+    description: Local development
+security:
+  - bearerAuth: []
+  - sessionCookie: []
+tags:
+  - name: auth
+  - name: organizations
+  - name: members
+  - name: member-credentials
+  - name: plans
+  - name: benefits
+  - name: providers
+  - name: eligibility
+  - name: visit-intents
+  - name: authorizations
+  - name: claims
+  - name: settlements
+  - name: imports
+  - name: integrations
+  - name: audit
+  - name: reports
+  - name: member-access
+  - name: payments
+
+paths:
+  # ───────────────────────── auth ─────────────────────────
+  /v1/auth/login:
+    post:
+      tags: [auth]
+      summary: Sign in with email + password
+      security: []
+      description: Rate limited per IP and per email. 5 consecutive failures lock the account for 15 minutes.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [email, password], properties: { email: { type: string, format: email }, password: { type: string } } }
+      responses:
+        "200":
+          description: Session created. Also sets the `hmoa_session` cookie.
+          content: { application/json: { schema: { type: object, properties: { token: { type: string }, expiresAt: { type: string, format: date-time } } } } }
+        "401": { $ref: "#/components/responses/Error" }
+        "423": { $ref: "#/components/responses/Error" }
+        "429": { $ref: "#/components/responses/Error" }
+  /v1/auth/logout:
+    post:
+      tags: [auth]
+      summary: Revoke the current session
+      responses: { "200": { description: Revoked }, "401": { $ref: "#/components/responses/Error" } }
+  /v1/auth/me:
+    get:
+      tags: [auth]
+      summary: Current user, active organization, role, permissions and branches
+      responses: { "200": { description: OK }, "401": { $ref: "#/components/responses/Error" } }
+  /v1/auth/switch-organization:
+    post:
+      tags: [auth]
+      summary: Switch the session's active organization (user must be a member)
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [orgId], properties: { orgId: { type: string, format: uuid } } } } } }
+      responses: { "200": { description: OK }, "403": { $ref: "#/components/responses/Error" } }
+  /v1/auth/password:
+    post:
+      tags: [auth]
+      summary: Change your password (needs the current one; signs out your other sessions)
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [currentPassword, newPassword], properties: { currentPassword: { type: string, format: password }, newPassword: { type: string, format: password, minLength: 12 } } } } } }
+      responses: { "200": { description: OK }, "401": { $ref: "#/components/responses/Error" }, "422": { $ref: "#/components/responses/Error" } }
+  /v1/auth/select-location:
+    post:
+      tags: [auth]
+      summary: Select the provider branch to act for
+      description: Only branches assigned to the staff member are allowed.
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [locationId], properties: { locationId: { type: string, format: uuid } } } } } }
+      responses: { "200": { description: OK }, "403": { $ref: "#/components/responses/Error" } }
+
+  # ───────────────────────── organizations ─────────────────────────
+  /v1/organizations:
+    get:
+      tags: [organizations]
+      summary: List all organizations
+      x-permission: platform:admin
+      responses: { "200": { description: OK } }
+  /v1/organizations/hmos:
+    post:
+      tags: [organizations]
+      summary: Onboard an HMO (creates org, profile, CSV integration and an admin user)
+      x-permission: platform:admin
+      description: Returns a one-time `temporaryPassword` for a newly created admin user. It is not stored.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, slug, admin]
+              properties:
+                name: { type: string }
+                slug: { type: string, pattern: "^[a-z0-9][a-z0-9-]{2,48}$" }
+                contactEmail: { type: string, format: email }
+                staleDataThresholdHours: { type: integer, default: 168 }
+                admin: { type: object, required: [email, name], properties: { email: { type: string }, name: { type: string } } }
+      responses: { "201": { description: Created }, "409": { $ref: "#/components/responses/Error" } }
+  /v1/organizations/providers:
+    post:
+      tags: [organizations]
+      summary: Onboard a provider with its locations and an admin user
+      x-permission: platform:admin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, slug, providerType, locations, admin]
+              properties:
+                name: { type: string }
+                slug: { type: string }
+                providerType: { type: string, example: GYM }
+                locations: { type: array, items: { type: object, required: [name], properties: { name: { type: string }, address: { type: string }, city: { type: string } } } }
+                admin: { type: object, required: [email, name], properties: { email: { type: string }, name: { type: string } } }
+      responses: { "201": { description: Created } }
+  /v1/organizations/{id}/status:
+    post:
+      tags: [organizations]
+      summary: Suspend or reactivate an organization (sessions of its users stop working immediately)
+      x-permission: platform:admin
+      parameters: [{ $ref: "#/components/parameters/id" }]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [status, reason], properties: { status: { enum: [ACTIVE, SUSPENDED] }, reason: { type: string } } } } } }
+      responses: { "200": { description: OK } }
+  /v1/organizations/me/staff:
+    get:
+      tags: [organizations]
+      summary: List staff of the active organization
+      x-permission: staff:manage
+      responses: { "200": { description: OK } }
+    post:
+      tags: [organizations]
+      summary: Add a staff member with a role (and branches for provider staff)
+      x-permission: staff:manage
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, name, roleKey]
+              properties:
+                email: { type: string }
+                name: { type: string }
+                roleKey: { enum: [HMO_ADMIN, HMO_OPERATIONS, HMO_CLAIMS, HMO_VIEWER, PROVIDER_ADMIN, PROVIDER_FRONT_DESK, PLATFORM_ADMIN] }
+                locationIds: { type: array, items: { type: string, format: uuid } }
+      responses: { "201": { description: Created; returns a one-time temporaryPassword for new users }, "409": { $ref: "#/components/responses/Error" } }
+  /v1/organizations/me/staff/{membershipId}/status:
+    post:
+      tags: [organizations]
+      summary: Enable or disable a staff member (disabling revokes their sessions)
+      x-permission: staff:manage
+      parameters: [{ name: membershipId, in: path, required: true, schema: { type: string, format: uuid } }]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, properties: { status: { enum: [ACTIVE, INACTIVE] } } } } } }
+      responses: { "200": { description: OK } }
+  /v1/organizations/me/locations:
+    get:
+      tags: [organizations]
+      summary: List the provider's branches
+      responses: { "200": { description: OK } }
+    post:
+      tags: [organizations]
+      summary: Add a provider branch
+      x-permission: provider:locations
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [name], properties: { name: { type: string }, address: { type: string }, city: { type: string } } } } } }
+      responses: { "201": { description: Created } }
+
+  # ───────────────────────── members ─────────────────────────
+  /v1/members:
+    get:
+      tags: [members]
+      summary: Search the HMO's members
+      x-permission: members:read
+      parameters:
+        - { name: q, in: query, schema: { type: string } }
+        - { name: limit, in: query, schema: { type: integer, maximum: 200 } }
+        - { name: offset, in: query, schema: { type: integer } }
+      responses: { "200": { description: "Members with masked phone (last 4 digits only)" } }
+  /v1/members/{id}:
+    get:
+      tags: [members]
+      summary: Member detail with coverage history and card credentials (no token values)
+      x-permission: members:read
+      parameters: [{ $ref: "#/components/parameters/id" }]
+      responses: { "200": { description: OK }, "404": { $ref: "#/components/responses/Error" } }
+  /v1/members/{id}/status:
+    post:
+      tags: [members]
+      summary: Suspend, terminate or reactivate a member
+      x-permission: members:write
+      parameters: [{ $ref: "#/components/parameters/id" }]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [status, reason], properties: { status: { enum: [ACTIVE, SUSPENDED, TERMINATED] }, reason: { type: string } } } } } }
+      responses: { "200": { description: OK } }
+  /v1/members/{id}/service-approvals:
+    get:
+      tags: [members]
+      summary: Referrals / pre-authorizations for a member
+      x-permission: members:read
+      parameters: [{ $ref: "#/components/parameters/id" }]
+      responses: { "200": { description: OK } }
+    post:
+      tags: [members]
+      summary: Issue a referral or pre-authorization (pre-authorizations are single-use)
+      x-permission: approvals:manage
+      parameters: [{ $ref: "#/components/parameters/id" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [benefitId, type, validFrom, validTo]
+              properties:
+                benefitId: { type: string, format: uuid }
+                providerOrgId: { type: [string, "null"], format: uuid }
+                type: { enum: [REFERRAL, PREAUTHORIZATION] }
+                validFrom: { type: string, format: date-time }
+                validTo: { type: string, format: date-time }
+      responses: { "201": { description: Created } }
+  /v1/service-approvals/{id}/revoke:
+    post:
+      tags: [members]
+      summary: Revoke an active referral / pre-authorization
+      x-permission: approvals:manage
+      parameters: [{ $ref: "#/components/parameters/id" }]
+      responses: { "200": { description: OK } }
+
+  # ───────────────────────── member credentials ─────────────────────────
+  /v1/member-credentials:
+    post:
+      tags: [member-credentials]
+      summary: Issue (or re-issue) a member's card QR credential
+      description: |
+        Returns the QR payload (`HMOA1.<43 random base64url chars>`) and an SVG **once**. Only an HMAC of the
+        token is stored. Re-issuing revokes the previous card credential. The payload contains no
+        name, phone, member number, plan or database id.
+      x-permission: credentials:manage
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [memberId], properties: { memberId: { type: string, format: uuid } } } } } }
+      responses: { "201": { description: Credential issued } }
+  /v1/member-credentials/{id}/revoke:
+    post:
+      tags: [member-credentials]
+      summary: Revoke a credential (lost card, suspected misuse)
+      x-permission: credentials:manage
+      parameters: [{ $ref: "#/components/parameters/id" }]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [reason], properties: { reason: { type: string } } } } } }
+      responses: { "200": { description: Revoked }, "404": { $ref: "#/components/responses/Error" } }
+
+  # ───────────────────────── plans & benefits ─────────────────────────
+  /v1/plans:
+    get:
+      tags: [plans]
+      summary: Plans with versions and benefit assignments
+      x-permission: members:read
+      responses: { "200": { description: OK } }
+    post:
+      tags: [plans]
+      summary: Create a plan
+      x-permission: plans:manage
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [code, name], properties: { code: { type: string }, name: { type: string } } } } } }
+      responses: { "201": { description: Created }, "409": { $ref: "#/components/responses/Error" } }
+  /v1/plans/{id}/versions:
+    post:
+      tags: [plans]
+      summary: Create a DRAFT plan version with benefit assignments (optionally restricted to member groups)
+      x-permission: plans:manage
+      parameters: [{ $ref: "#/components/parameters/id" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [effectiveFrom, benefits]
+              properties:
+                effectiveFrom: { type: string, format: date-time }
+                effectiveTo: { type: [string, "null"], format: date-time }
+                notes: { type: string }
+                benefits: { type: array, items: { type: object, required: [benefitId], properties: { benefitId: { type: string, format: uuid }, memberGroups: { type: array, items: { type: string } } } } }
+      responses: { "201": { description: Created } }
+  /v1/plans/versions/{versionId}/publish:
+    post:
+      tags: [plans]
+      summary: Publish a draft version; closes the previously open version at this version's effectiveFrom
+      x-permission: plans:manage
+      parameters: [{ name: versionId, in: path, required: true, schema: { type: string, format: uuid } }]
+      responses: { "200": { description: Published }, "409": { $ref: "#/components/responses/Error" } }
+  /v1/benefits:
+    get:
+      tags: [benefits]
+      summary: Benefits with versions and a plain-language rule summary
+      x-permission: members:read
+      responses: { "200": { description: OK } }
+    post:
+      tags: [benefits]
+      summary: Create a benefit (code, name, category)
+      x-permission: benefits:manage
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [code, name, category], properties: { code: { type: string }, name: { type: string }, category: { type: string, example: fitness }, description: { type: string } } } } } }
+      responses: { "201": { description: Created } }
+  /v1/benefits/validate-rules:
+    post:
+      tags: [benefits]
+      summary: Validate a rules document without saving; returns a plain-language summary
+      x-permission: any authenticated user
+      requestBody: { required: true, content: { application/json: { schema: { $ref: "#/components/schemas/BenefitRules" } } } }
+      responses: { "200": { description: "{ valid, rules, summary } or { valid: false, issues }" } }
+  /v1/benefits/{id}/versions:
+    post:
+      tags: [benefits]
+      summary: Create a DRAFT benefit version with validated rules
+      x-permission: benefits:manage
+      parameters: [{ $ref: "#/components/parameters/id" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [effectiveFrom, rules]
+              properties:
+                effectiveFrom: { type: string, format: date-time }
+                effectiveTo: { type: [string, "null"], format: date-time }
+                terms: { type: string }
+                rules: { $ref: "#/components/schemas/BenefitRules" }
+      responses: { "201": { description: Created }, "422": { $ref: "#/components/responses/Error" } }
+  /v1/benefits/versions/{versionId}:
+    put:
+      tags: [benefits]
+      summary: Edit a DRAFT benefit version (published versions are immutable)
+      x-permission: benefits:manage
+      parameters: [{ name: versionId, in: path, required: true, schema: { type: string, format: uuid } }]
+      responses: { "200": { description: Updated }, "409": { $ref: "#/components/responses/Error" } }
+  /v1/benefits/versions/{versionId}/publish:
+    post:
+      tags: [benefits]
+      summary: Publish a benefit version; the previous open version is closed, never edited
+      x-permission: benefits:manage
+      parameters: [{ name: versionId, in: path, required: true, schema: { type: string, format: uuid } }]
+      responses: { "200": { description: Published } }
+
+  # ───────────────────────── providers & network ─────────────────────────
+  /v1/providers:
+    get:
+      tags: [providers]
+      summary: Platform providers with this HMO's contract, location approvals and active tariffs
+      x-permission: network:manage
+      responses: { "200": { description: OK } }
+  /v1/providers/networks:
+    get:
+      tags: [providers]
+      summary: (Provider) HMOs this provider has a contract with
+      x-permission: eligibility:check
+      responses: { "200": { description: OK } }
+  /v1/providers/{providerOrgId}/contract:
+    put:
+      tags: [providers]
+      summary: Approve / suspend a provider and set settlement terms
+      x-permission: network:manage
+      parameters: [{ name: providerOrgId, in: path, required: true, schema: { type: string, format: uuid } }]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [status], properties: { status: { enum: [PENDING, APPROVED, SUSPENDED] }, settlementTermsDays: { type: integer }, settlementTermsNotes: { type: string } } } } } }
+      responses: { "200": { description: OK } }
+  /v1/providers/locations/{locationId}/network:
+    put:
+      tags: [providers]
+      summary: Approve or suspend one provider branch for this HMO
+      x-permission: network:manage
+      parameters: [{ name: locationId, in: path, required: true, schema: { type: string, format: uuid } }]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, properties: { status: { enum: [APPROVED, SUSPENDED] } } } } } }
+      responses: { "200": { description: OK } }
+  /v1/providers/tariffs:
+    post:
+      tags: [providers]
+      summary: Set a provider-specific tariff (ends the previous tariff; history is kept)
+      x-permission: network:manage
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [providerOrgId, benefitId, tariffMinor]
+              properties:
+                providerOrgId: { type: string, format: uuid }
+                benefitId: { type: string, format: uuid }
+                locationId: { type: [string, "null"], format: uuid, description: "null = all approved branches" }
+                tariffMinor: { type: integer, example: 200000 }
+                currency: { type: string, default: NGN }
+                effectiveFrom: { type: string, format: date-time }
+      responses: { "201": { description: Created } }
+
+  # ───────────────────────── eligibility ─────────────────────────
+  /v1/eligibility/checks:
+    post:
+      tags: [eligibility]
+      summary: Check eligibility (never consumes allowance)
+      description: |
+        Resolves the member from a QR payload, platform member reference (`HM-XXXXXXX`) or HMO member
+        number, then evaluates every benefit this provider has a tariff for (or `benefitId`).
+        Unknown credentials and members outside the provider's network both return `404 CREDENTIAL_INVALID`.
+        `decision` is `ELIGIBLE`, `INELIGIBLE` (with reasons) or `UNVERIFIABLE` (stale data / HMO source
+        unreachable — never treated as approved).
+        `checkIn.outcome` tells the front desk what a scan means: `ACCEPTED` (start a check-in),
+        `DUPLICATE` (a check-in for this member is already in progress at this branch — continue
+        `openVisitIntentId`), `COOLDOWN` (a check-in succeeded less than `cooldownMinutes` ago; nothing new is
+        recorded; `existing` identifies it only when it was at the caller's own organization) or `REJECTED`.
+      x-permission: eligibility:check
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [lookup]
+              properties:
+                lookup: { $ref: "#/components/schemas/Lookup" }
+                locationId: { type: string, format: uuid, description: Defaults to the session's selected branch }
+                benefitId: { type: string, format: uuid }
+                quantity: { type: integer, minimum: 1 }
+      responses:
+        "200": { description: Decision per benefit, content: { application/json: { schema: { $ref: "#/components/schemas/EligibilityResponse" } } } }
+        "404": { $ref: "#/components/responses/Error" }
+        "429": { $ref: "#/components/responses/Error" }
+    get:
+      tags: [eligibility]
+      summary: Recent checks by this provider
+      x-permission: eligibility:check
+      responses: { "200": { description: OK } }
+
+  # ───────────────────────── visit intents ─────────────────────────
+  /v1/visit-intents:
+    post:
+      tags: [visit-intents]
+      summary: Start a visit from an ELIGIBLE check (≤10 min old); sends an SMS OTP when the benefit requires it
+      description: |
+        If the SMS provider fails, `otp.status` is `SEND_FAILED` — the API never reports a failed send as sent.
+        At most one check-in per member + benefit + branch can be in progress (enforced by a database index).
+        A repeated request while one is open returns that check-in with `scanOutcome: DUPLICATE` and status
+        `200`, and no new code is sent. Eligibility (including the check-in cooldown) is re-evaluated on the
+        server first: `409 CHECK_IN_COOLDOWN` (details: lastCheckInAt, nextAllowedAt, cooldownMinutes) or
+        `422 NOT_ELIGIBLE`.
+      x-permission: visits:manage
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [eligibilityCheckId], properties: { eligibilityCheckId: { type: string, format: uuid }, quantity: { type: integer } } } } } }
+      responses:
+        "201": { description: Check-in started (scanOutcome ACCEPTED), content: { application/json: { schema: { $ref: "#/components/schemas/VisitIntent" } } } }
+        "200": { description: The check-in already in progress (scanOutcome DUPLICATE), content: { application/json: { schema: { $ref: "#/components/schemas/VisitIntent" } } } }
+        "409": { $ref: "#/components/responses/Error" }
+        "422": { $ref: "#/components/responses/Error" }
+  /v1/visit-intents/{id}:
+    get:
+      tags: [visit-intents]
+      summary: Visit intent status (including OTP state, never the code)
+      x-permission: visits:manage
+      parameters: [{ $ref: "#/components/parameters/id" }]
+      responses: { "200": { description: OK } }
+  /v1/visit-intents/{id}/otp/resend:
+    post:
+      tags: [visit-intents]
+      summary: Send a new code (cooldown, max 3 sends; old code stops working)
+      x-permission: visits:manage
+      parameters: [{ $ref: "#/components/parameters/id" }]
+      responses: { "200": { description: OK }, "429": { $ref: "#/components/responses/Error" } }
+  /v1/visit-intents/{id}/otp/verify:
+    post:
+      tags: [visit-intents]
+      summary: Verify the member's code (single use, limited attempts, bound to this visit + provider)
+      x-permission: visits:manage
+      parameters: [{ $ref: "#/components/parameters/id" }]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [code], properties: { code: { type: string, pattern: "^\\d{6}$" } } } } } }
+      responses: { "200": { description: Confirmed }, "410": { $ref: "#/components/responses/Error" }, "422": { $ref: "#/components/responses/Error" }, "423": { $ref: "#/components/responses/Error" } }
+  /v1/visit-intents/{id}/authorize:
+    post:
+      tags: [visit-intents]
+      summary: Authorize the visit and consume allowance exactly once
+      description: |
+        Re-validates coverage, versions, provider/branch, limits, monetary caps, referrals/pre-authorizations and
+        the HMO's live source (if configured) under a per-member-per-benefit lock.
+        Requires an `Idempotency-Key` header. Same key + same visit → `200` with the original authorization
+        (`replay: true`). Same key + different visit → `409 IDEMPOTENCY_MISMATCH`. Visit already authorized
+        under another key → `409 CONFLICT`. A successful check-in for the same member and benefit within the
+        cooldown (any branch or provider) → `409 CHECK_IN_COOLDOWN`; this check runs under the same lock, so
+        simultaneous requests from several desks record exactly one visit.
+      x-permission: visits:manage
+      parameters:
+        - { $ref: "#/components/parameters/id" }
+        - { name: Idempotency-Key, in: header, required: true, schema: { type: string, pattern: "^[A-Za-z0-9_-]{8,100}$" } }
+      responses:
+        "201": { description: Authorized, content: { application/json: { schema: { $ref: "#/components/schemas/AuthorizationResult" } } } }
+        "200": { description: Idempotent replay }
+        "409": { $ref: "#/components/responses/Error" }
+        "422": { description: "NOT_ELIGIBLE (details.reasons) or validation error", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+
+  # ───────────────────────── authorizations ─────────────────────────
+  /v1/authorizations:
+    get:
+      tags: [authorizations]
+      summary: Visits for the caller's HMO or provider (providers see a minimal member view)
+      x-permission: authorizations:read
+      parameters: [{ name: status, in: query, schema: { enum: [AUTHORIZED, COMPLETED, CANCELLED, EXPIRED] } }]
+      responses: { "200": { description: OK } }
+  /v1/authorizations/receipts/{reference}:
+    get:
+      tags: [authorizations]
+      summary: Printable visit receipt
+      x-permission: authorizations:read
+      parameters: [{ name: reference, in: path, required: true, schema: { type: string, pattern: "^AUTH-[A-Z0-9]{8}$" } }]
+      responses: { "200": { description: OK }, "404": { $ref: "#/components/responses/Error" } }
+  /v1/authorizations/{id}/complete:
+    post:
+      tags: [authorizations]
+      summary: Mark the service delivered; optionally submit the claim in the same step
+      description: Fails with 409 if the authorization expired (its allowance is released). Sends a best-effort SMS receipt.
+      x-permission: visits:manage
+      parameters: [{ $ref: "#/components/parameters/id" }]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [attendanceConfirmed], properties: { attendanceConfirmed: { type: boolean }, notes: { type: string }, submitClaim: { type: boolean, default: true } } } } } }
+      responses: { "200": { description: Completed } }
+  /v1/authorizations/{id}/cancel:
+    post:
+      tags: [authorizations]
+      summary: Cancel an authorized, not-yet-completed visit (releases allowance)
+      x-permission: visits:manage
+      parameters: [{ $ref: "#/components/parameters/id" }]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [reason], properties: { reason: { type: string } } } } } }
+      responses: { "200": { description: Cancelled } }
+
+  # ───────────────────────── claims ─────────────────────────
+  /v1/claims:
+    get:
+      tags: [claims]
+      summary: Claims for the caller's organization
+      x-permission: claims:read
+      parameters: [{ name: status, in: query, schema: { $ref: "#/components/schemas/ClaimStatus" } }]
+      responses: { "200": { description: OK } }
+    post:
+      tags: [claims]
+      summary: (Provider) Submit a claim for a completed visit
+      x-permission: claims:submit
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [authorizationId, attendanceConfirmed], properties: { authorizationId: { type: string, format: uuid }, attendanceConfirmed: { type: boolean }, notes: { type: string } } } } } }
+      responses: { "201": { description: Submitted }, "409": { $ref: "#/components/responses/Error" } }
+  /v1/claims/{id}:
+    get:
+      tags: [claims]
+      summary: Claim with adjustments and audit history
+      x-permission: claims:read
+      parameters: [{ $ref: "#/components/parameters/id" }]
+      responses: { "200": { description: OK } }
+  /v1/claims/{id}/review:
+    post:
+      tags: [claims]
+      summary: Move to UNDER_REVIEW
+      x-permission: claims:review
+      parameters: [{ $ref: "#/components/parameters/id" }]
+      responses: { "200": { description: OK }, "409": { $ref: "#/components/responses/Error" } }
+  /v1/claims/{id}/approve:
+    post:
+      tags: [claims]
+      summary: Approve (approved = claimed + Σ adjustments)
+      x-permission: claims:review
+      parameters: [{ $ref: "#/components/parameters/id" }]
+      responses: { "200": { description: OK } }
+  /v1/claims/{id}/reject:
+    post:
+      tags: [claims]
+      summary: Reject with a reason; optionally restore the member's allowance
+      x-permission: claims:review
+      parameters: [{ $ref: "#/components/parameters/id" }]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [reason], properties: { reason: { type: string }, restoreAllowance: { type: boolean, default: false } } } } } }
+      responses: { "200": { description: OK } }
+  /v1/claims/{id}/adjust:
+    post:
+      tags: [claims]
+      summary: Append an adjustment (before approval; append-only)
+      x-permission: claims:review
+      parameters: [{ $ref: "#/components/parameters/id" }]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [deltaMinor, reason], properties: { deltaMinor: { type: integer }, reason: { type: string } } } } } }
+      responses: { "201": { description: Adjustment recorded } }
+  /v1/claims/{id}/dispute:
+    post:
+      tags: [claims]
+      summary: (Provider) Dispute a rejected or adjusted claim before it is in a settlement
+      x-permission: claims:submit
+      parameters: [{ $ref: "#/components/parameters/id" }]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [reason], properties: { reason: { type: string } } } } } }
+      responses: { "200": { description: OK } }
+
+  # ───────────────────────── settlements ─────────────────────────
+  /v1/settlements:
+    get:
+      tags: [settlements]
+      summary: Settlements for the caller's organization
+      x-permission: settlements:read
+      responses: { "200": { description: OK } }
+    post:
+      tags: [settlements]
+      summary: Create a DRAFT settlement from approved, unsettled claims for one provider
+      x-permission: settlements:manage
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [providerOrgId], properties: { providerOrgId: { type: string, format: uuid }, claimIds: { type: array, items: { type: string, format: uuid } }, periodEnd: { type: string, format: date-time }, notes: { type: string } } } } } }
+      responses: { "201": { description: Created } }
+  /v1/settlements/ledger:
+    get:
+      tags: [settlements]
+      summary: Provider payable ledger (one row per claim); `?format=csv` for export
+      x-permission: claims:read
+      parameters: [{ name: format, in: query, schema: { enum: [json, csv] } }]
+      responses: { "200": { description: OK } }
+  /v1/settlements/{id}:
+    get:
+      tags: [settlements]
+      summary: Settlement with its claims
+      x-permission: settlements:read
+      parameters: [{ $ref: "#/components/parameters/id" }]
+      responses: { "200": { description: OK } }
+  /v1/settlements/{id}/approve:
+    post:
+      tags: [settlements]
+      summary: DRAFT → APPROVED
+      x-permission: settlements:manage
+      parameters: [{ $ref: "#/components/parameters/id" }]
+      responses: { "200": { description: OK } }
+  /v1/settlements/{id}/cancel:
+    post:
+      tags: [settlements]
+      summary: Cancel a DRAFT/APPROVED settlement; its claims become available again
+      x-permission: settlements:manage
+      parameters: [{ $ref: "#/components/parameters/id" }]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [reason], properties: { reason: { type: string } } } } } }
+      responses: { "200": { description: OK } }
+  /v1/settlements/{id}/payment:
+    post:
+      tags: [settlements]
+      summary: Record the HMO's payment (amount must equal the total; reference unique per HMO)
+      description: The platform does not move money. A settlement can only be PAID with a payment reference, amount and date (DB-enforced).
+      x-permission: settlements:manage
+      parameters: [{ $ref: "#/components/parameters/id" }]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [paymentReference, amountMinor, paidAt], properties: { paymentReference: { type: string }, amountMinor: { type: integer }, paidAt: { type: string, format: date-time }, paymentMethod: { type: string, default: BANK_TRANSFER } } } } } }
+      responses: { "200": { description: PAID }, "409": { $ref: "#/components/responses/Error" } }
+  /v1/settlements/{id}/reconcile:
+    post:
+      tags: [settlements]
+      summary: Reconcile against the bank statement; match → RECONCILED + claims SETTLED, else RECONCILIATION_MISMATCH
+      x-permission: settlements:manage
+      parameters: [{ $ref: "#/components/parameters/id" }]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [statementReference, confirmedAmountMinor], properties: { statementReference: { type: string }, confirmedAmountMinor: { type: integer } } } } } }
+      responses: { "200": { description: OK } }
+  /v1/settlements/{id}/confirm-receipt:
+    post:
+      tags: [settlements]
+      summary: (Provider) Acknowledge that funds were received (for manually recorded payments)
+      x-permission: settlements:manage
+      parameters: [{ $ref: "#/components/parameters/id" }]
+      responses: { "200": { description: OK } }
+  /v1/settlements/{id}/payment-instructions:
+    post:
+      tags: [payments]
+      summary: APPROVED → AWAITING_PAYMENT; returns the collection account, exact amount and reference to pay (idempotent)
+      description: |
+        The partner issues one collection account per HMO–provider pair that settles straight to the provider's
+        verified payout account. The settlement is marked paid only when the bank confirms matching credits.
+        409 INVALID_STATE when the provider has no active payout account; 503 when the partner is unreachable.
+      x-permission: settlements:manage
+      parameters: [{ $ref: "#/components/parameters/id" }]
+      responses: { "200": { description: "{ settlement, instructions: { accountNumber, bankName, accountName, amountMinor, currency, reference, narration } }" }, "409": { $ref: "#/components/responses/Error" }, "503": { $ref: "#/components/responses/Error" } }
+  /v1/settlements/{id}/resolve-exception:
+    post:
+      tags: [payments]
+      summary: Record how a bank-verified overpayment was handled; the settlement becomes RECONCILED
+      x-permission: settlements:manage
+      parameters: [{ $ref: "#/components/parameters/id" }]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [resolution], properties: { resolution: { type: string, minLength: 5, maxLength: 500 } } } } } }
+      responses: { "200": { description: Settlement }, "409": { $ref: "#/components/responses/Error" } }
+
+  # ───────────────────────── verified payments ─────────────────────────
+  /v1/payments/status:
+    get:
+      tags: [payments]
+      summary: Payment partner mode (simulate / live / off) and whether manual payment records are allowed
+      responses: { "200": { description: "{ mode, partner, partnerName, simulated, manualAllowed }" } }
+  /v1/payments/banks:
+    get:
+      tags: [payments]
+      summary: Banks supported by the payment partner
+      x-permission: settlements:read
+      responses: { "200": { description: "{ items: [{ code, name }] }" } }
+  /v1/payments/payout-accounts:
+    get:
+      tags: [payments]
+      summary: "Payout accounts: provider = its own history; HMO = active and scheduled accounts of providers in its network; platform = all"
+      responses: { "200": { description: "{ items } — account numbers are masked (last 4 digits only)" } }
+    post:
+      tags: [payments]
+      summary: (Provider owner) Add or change the bank account that receives HMO payments
+      description: |
+        Requires the user's password again. The bank's account name is fetched (name enquiry) and compared with the
+        provider's registered name: a score below PAYOUT_NAME_MATCH_MIN, or an account already registered by another
+        provider, goes to platform review (PENDING_REVIEW). A first account is ACTIVE at once; a change is SCHEDULED and
+        takes effect after PAYOUT_CHANGE_HOLD_HOURS (48). HMOs in the provider's network are notified.
+      x-permission: payouts:manage
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [bankCode, accountNumber, password], properties: { bankCode: { type: string }, accountNumber: { type: string, pattern: "^\\d{10}$" }, password: { type: string, format: password } } } } } }
+      responses: { "201": { description: Payout account (masked) }, "401": { $ref: "#/components/responses/Error" }, "409": { $ref: "#/components/responses/Error" }, "422": { $ref: "#/components/responses/Error" } }
+  /v1/payments/payout-accounts/{id}/cancel:
+    post:
+      tags: [payments]
+      summary: (Provider owner) Cancel a scheduled or under-review change
+      x-permission: payouts:manage
+      parameters: [{ $ref: "#/components/parameters/id" }]
+      responses: { "200": { description: OK }, "409": { $ref: "#/components/responses/Error" } }
+  /v1/payments/payout-accounts/{id}/review:
+    post:
+      tags: [payments]
+      summary: (Platform) Approve or reject a payout account whose name didn't match or that is shared
+      x-permission: platform:admin
+      parameters: [{ $ref: "#/components/parameters/id" }]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [decision, note], properties: { decision: { enum: [APPROVE, REJECT] }, note: { type: string } } } } } }
+      responses: { "200": { description: OK } }
+  /v1/payments/credits:
+    get:
+      tags: [payments]
+      summary: Bank credits reported by the partner, with verification and matching results (scoped to the caller)
+      parameters: [{ name: status, in: query, schema: { enum: [PENDING, MATCHED, UNMATCHED, EXCEPTION, DUPLICATE, REJECTED] } }]
+      x-permission: settlements:read
+      responses: { "200": { description: "{ items: [{ id, transactionRef, sessionId, amountMinor, currency, narration, senderName, verification, verificationNote, matchStatus, matchRule, settlementId, exceptionReason, resolution }] }" } }
+  /v1/payments/credits/{id}/assign:
+    post:
+      tags: [payments]
+      summary: (HMO) Assign a verified but unmatched credit to a payment of the same provider that is awaiting money
+      x-permission: settlements:manage
+      parameters: [{ $ref: "#/components/parameters/id" }]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [settlementId], properties: { settlementId: { type: string, format: uuid } } } } } }
+      responses: { "200": { description: Credit }, "404": { $ref: "#/components/responses/Error" }, "409": { $ref: "#/components/responses/Error" } }
+  /v1/payments/credits/{id}/resolve:
+    post:
+      tags: [payments]
+      summary: (HMO / platform) Record how an uncounted credit was handled (e.g. refunded). The money is never counted
+      parameters: [{ $ref: "#/components/parameters/id" }]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [resolution], properties: { resolution: { type: string } } } } } }
+      responses: { "200": { description: Credit } }
+  /v1/payments/webhooks/{partner}:
+    post:
+      tags: [payments]
+      summary: Payment partner notifications (e.g. Paystack charge.success for dedicated accounts)
+      description: |
+        Authenticated by the partner's signature (Paystack: x-paystack-signature = HMAC-SHA512 of the raw body with the
+        secret key; optional source-IP allow-list). Invalid → 401, audited, nothing stored. A credit is stored once per
+        partner transaction reference, then counted only after re-querying the partner confirms the transaction,
+        account, amount and currency, and the interbank session id has not been counted before.
+      security: []
+      parameters: [{ name: partner, in: path, required: true, schema: { type: string, example: paystack } }]
+      responses: { "200": { description: "{ status: RECEIVED | DUPLICATE | IGNORED, creditId, verification, matchStatus }" }, "401": { $ref: "#/components/responses/Error" } }
+
+  # ───────────────────────── imports ─────────────────────────
+  /v1/imports:
+    post:
+      tags: [imports]
+      summary: Upload a member CSV/XLSX and get a validation report (nothing is applied)
+      description: |
+        See docs/integration/HMO_INTEGRATION_GUIDE.md and docs/integration/UPLOAD_SPECIFICATION.md.
+        The file type is decided from the bytes (CSV text, or a macro-free .xlsx zip); the extension and the
+        browser's MIME type are not trusted. Limits: IMPORT_MAX_BYTES (5 MB), IMPORT_MAX_ROWS (20,000), 50 columns,
+        500 characters per cell. Optional malware scan (ClamAV). Every importable row is classified NEW, UPDATE,
+        UNCHANGED or CONFLICT (name differs from the existing member); duplicates and look-alikes are listed in
+        `warnings`. Oversized bodies → `413 PAYLOAD_TOO_LARGE`.
+      x-permission: imports:manage
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file: { type: string, format: binary }
+                mapping: { type: string, description: JSON object mapping field names to column headers }
+                duplicatePhones: { enum: [FLAG, REJECT], default: FLAG, description: "FLAG: shared phone numbers are applied and listed for review. REJECT: those rows are not applied." }
+      responses:
+        "201": { description: "Validation report: job, counts {new, update, unchanged, conflict}, errors, warnings, conflicts, previewRows" }
+        "413": { $ref: "#/components/responses/Error" }
+        "422": { $ref: "#/components/responses/Error" }
+        "503": { description: Malware scanning required but unavailable }
+    get:
+      tags: [imports]
+      summary: Import history
+      x-permission: imports:manage
+      responses: { "200": { description: OK } }
+  /v1/imports/{id}:
+    get:
+      tags: [imports]
+      summary: Import job with status, progress, errors and warnings (poll this while QUEUED / PROCESSING)
+      x-permission: imports:manage
+      parameters: [{ $ref: "#/components/parameters/id" }]
+      responses: { "200": { description: OK } }
+  /v1/imports/{id}/rows:
+    get:
+      tags: [imports]
+      summary: Per-row results (PENDING, APPLIED, HELD, FAILED) — which records succeeded and which did not
+      x-permission: imports:manage
+      parameters:
+        - { $ref: "#/components/parameters/id" }
+        - { name: status, in: query, schema: { enum: [PENDING, APPLIED, HELD, FAILED] } }
+        - { name: limit, in: query, schema: { type: integer, maximum: 1000, default: 200 } }
+        - { name: offset, in: query, schema: { type: integer, default: 0 } }
+      responses: { "200": { description: "{ items: [{ row, memberNumber, classification, changedFields, warnings, status, outcome, error, processedAt }], total }" } }
+  /v1/imports/{id}/errors.csv:
+    get:
+      tags: [imports]
+      summary: Row-level errors as CSV (formula-injection safe)
+      x-permission: imports:manage
+      parameters: [{ $ref: "#/components/parameters/id" }]
+      responses: { "200": { description: CSV } }
+  /v1/imports/{id}/report.csv:
+    get:
+      tags: [imports]
+      summary: Full report as CSV — errors, warnings, held and failed rows (formula-injection safe)
+      x-permission: imports:manage
+      parameters: [{ $ref: "#/components/parameters/id" }]
+      responses: { "200": { description: CSV } }
+  /v1/imports/{id}/apply:
+    post:
+      tags: [imports]
+      summary: Apply the staged rows (idempotent; identical files are applied once; a stopped job resumes)
+      description: |
+        Small imports (≤ IMPORT_INLINE_MAX_ROWS, default 500 rows) finish before the response (`200`, final
+        status APPLIED / PARTIALLY_APPLIED / FAILED). Larger ones return `202` with status QUEUED and are applied
+        by the background worker in batches; poll `GET /v1/imports/{id}`. Rows whose name differs from the
+        existing member are HELD unless `acceptIdentityChanges` is true (needs members:write).
+      x-permission: imports:manage
+      parameters: [{ $ref: "#/components/parameters/id" }]
+      requestBody: { required: false, content: { application/json: { schema: { type: object, properties: { acceptIdentityChanges: { type: boolean, default: false } } } } } }
+      responses:
+        "200": { description: "{ jobId, status, summary (incl. retroactiveConflicts), progress, idempotentReplay }" }
+        "202": { description: Queued for background processing }
+  /v1/imports/{id}/apply-held:
+    post:
+      tags: [imports]
+      summary: Accept the name changes held by a finished import and apply those rows (needs members:write)
+      x-permission: imports:manage
+      parameters: [{ $ref: "#/components/parameters/id" }]
+      responses: { "200": { description: Import job }, "409": { $ref: "#/components/responses/Error" } }
+  /v1/imports/{id}/cancel:
+    post:
+      tags: [imports]
+      summary: Discard a previewed import (staged rows are deleted)
+      x-permission: imports:manage
+      parameters: [{ $ref: "#/components/parameters/id" }]
+      responses: { "200": { description: OK } }
+
+  # ───────────────────────── integrations ─────────────────────────
+  /v1/integrations/health:
+    get:
+      tags: [integrations]
+      summary: (HMO) Data freshness and connector health
+      x-permission: members:read
+      responses: { "200": { description: OK } }
+  /v1/integrations:
+    get:
+      tags: [integrations]
+      summary: All integration configs
+      x-permission: platform:admin
+      responses: { "200": { description: OK } }
+    post:
+      tags: [integrations]
+      summary: Create a connector config (secrets referenced by env-var name only)
+      x-permission: platform:admin
+      requestBody: { required: true, content: { application/json: { schema: { $ref: "#/components/schemas/IntegrationInput" } } } }
+      responses: { "201": { description: Created } }
+  /v1/integrations/{id}:
+    put:
+      tags: [integrations]
+      summary: Update a connector config
+      x-permission: platform:admin
+      parameters: [{ $ref: "#/components/parameters/id" }]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: "#/components/schemas/IntegrationInput" } } } }
+      responses: { "200": { description: OK } }
+  /v1/integrations/{id}/webhook:
+    post:
+      tags: [integrations]
+      summary: Signed member-data push from an HMO
+      security: []
+      description: |
+        Header `x-hmoa-signature: sha256=<hex HMAC-SHA256(raw body, secret)>` and `x-hmoa-event-id`.
+        Body: `{ "eventType": "members.upsert", "members": [ { memberNumber, firstName, lastName, phone, planCode, coverageStart, coverageEnd?, coverageStatus?, memberGroup? } ] }`.
+        Duplicate event ids return `200 {status: DUPLICATE}`; failed events may be retried with the same id.
+      parameters: [{ $ref: "#/components/parameters/id" }]
+      responses: { "202": { description: Processed }, "200": { description: Duplicate }, "401": { $ref: "#/components/responses/Error" } }
+
+  # ───────────────────────── audit, reports, admin ─────────────────────────
+  /v1/audit:
+    get:
+      tags: [audit]
+      summary: Append-only audit events (own organization; platform admins may filter by orgId)
+      x-permission: audit:read
+      parameters:
+        - { name: entityType, in: query, schema: { type: string } }
+        - { name: entityId, in: query, schema: { type: string } }
+        - { name: orgId, in: query, schema: { type: string, format: uuid } }
+      responses: { "200": { description: OK } }
+  /v1/reports/metrics:
+    get:
+      tags: [reports]
+      summary: Pilot evidence metrics computed from recorded events (unmeasured metrics are null, not estimated)
+      x-permission: reports:export (HMO), claims:read (provider), platform:admin
+      parameters: [{ name: days, in: query, schema: { type: integer, default: 30 } }]
+      responses: { "200": { description: OK } }
+  /v1/reports/utilisation.csv:
+    get:
+      tags: [reports]
+      summary: Utilisation export
+      x-permission: reports:export
+      responses: { "200": { description: CSV } }
+  /v1/reports/reconciliation.csv:
+    get:
+      tags: [reports]
+      summary: Reconciliation export (provider payable ledger)
+      x-permission: reports:export
+      responses: { "200": { description: CSV } }
+  /v1/admin/housekeeping:
+    post:
+      tags: [audit]
+      summary: Expire stale visit intents/authorizations (releasing allowance), prune rate-limit buckets, purge expired import staging
+      x-permission: platform:admin
+      responses: { "200": { description: Counts } }
+  /v1/admin/integrity:
+    get:
+      tags: [audit]
+      summary: Read-only data-integrity report (tenant cross-wiring, case duplicates, look-alikes); ids and counts only
+      x-permission: platform:admin
+      responses: { "200": { description: "{ ok, blocking, review, findings: [{ check, severity, description, resolution, groups, sample }] }" } }
+
+  # ───────────────────────── member self-service ─────────────────────────
+  /v1/member-access/start:
+    post:
+      tags: [member-access]
+      summary: Member enters their reference + registered phone; an OTP is sent if they match
+      security: []
+      description: The response is identical whether or not the details match (no enumeration).
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [memberRef, phone], properties: { memberRef: { type: string }, phone: { type: string } } } } } }
+      responses: { "200": { description: "{ message, challengeId|null }" }, "503": { $ref: "#/components/responses/Error" } }
+  /v1/member-access/verify:
+    post:
+      tags: [member-access]
+      summary: Verify the member OTP; sets a 30-minute signed `hmoa_member` cookie
+      security: []
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [challengeId, code], properties: { challengeId: { type: string, format: uuid }, code: { type: string } } } } } }
+      responses: { "200": { description: OK } }
+  /v1/member-access/me:
+    get:
+      tags: [member-access]
+      summary: Member's coverage, benefits with remaining allowance, and recent visits
+      security: [{ memberCookie: [] }]
+      responses: { "200": { description: OK }, "401": { $ref: "#/components/responses/Error" } }
+  /v1/member-access/qr:
+    post:
+      tags: [member-access]
+      summary: Issue a short-lived (5 min) QR for the member to show at the front desk
+      security: [{ memberCookie: [] }]
+      responses: { "200": { description: "{ qrSvg, qrPayload, expiresAt }" } }
+  /v1/member-access/logout:
+    post:
+      tags: [member-access]
+      summary: Clear the member cookie
+      security: []
+      responses: { "200": { description: OK } }
+
+  # ───────────────────────── phone simulator ─────────────────────────
+  /v1/simulator/messages:
+    get:
+      tags: [member-access]
+      summary: Simulated SMS inbox (only while SMS_MODE resolves to simulate)
+      description: |
+        Returns phones that received simulated texts and their messages, including OTP codes, so flows can be
+        tested without a real SMS provider. 404 when SMS is live or off. In a production build with
+        simulation explicitly allowed (staging), platform admins only.
+      security: []
+      parameters: [{ name: phone, in: query, schema: { type: string, example: "+2348000001001" } }]
+      responses: { "200": { description: "{ sms, phones, messages }" }, "404": { $ref: "#/components/responses/Error" } }
+  /v1/simulator/bank:
+    get:
+      tags: [payments]
+      summary: Bank simulator overview (only while PAYMENTS_MODE resolves to simulate)
+      security: []
+      responses: { "200": { description: "{ collectionAccounts, transfers, credits, bankAccounts }" }, "404": { $ref: "#/components/responses/Error" } }
+  /v1/simulator/bank/accounts:
+    post:
+      tags: [payments]
+      summary: Open a test account at the simulated bank (for name enquiry)
+      security: []
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [bankCode, accountName], properties: { bankCode: { type: string }, accountName: { type: string }, accountNumber: { type: string } } } } } }
+      responses: { "201": { description: Account } }
+  /v1/simulator/bank/transfers:
+    post:
+      tags: [payments]
+      summary: Simulate an HMO transfer into a collection account and deliver the signed partner notification
+      description: "tamper: NONE | FORGED_AMOUNT | BAD_SIGNATURE | DUPLICATE_NOTIFICATION | DUPLICATE_SESSION | UNKNOWN_TRANSFER — to exercise each safeguard."
+      security: []
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [accountNumber, amountMinor], properties: { accountNumber: { type: string }, amountMinor: { type: integer }, narration: { type: string }, tamper: { type: string } } } } } }
+      responses: { "201": { description: "{ reference, sessionId, deliveries }" } }
+
+components:
+  securitySchemes:
+    bearerAuth: { type: http, scheme: bearer }
+    sessionCookie: { type: apiKey, in: cookie, name: hmoa_session }
+    memberCookie: { type: apiKey, in: cookie, name: hmoa_member }
+  parameters:
+    id: { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+  responses:
+    Error:
+      description: Error
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message, retryable]
+          properties:
+            code:
+              enum: [VALIDATION_FAILED, UNAUTHENTICATED, FORBIDDEN, NOT_FOUND, CONFLICT, INVALID_STATE, RATE_LIMITED, IDEMPOTENCY_MISMATCH, ACCOUNT_LOCKED, CREDENTIAL_INVALID, OTP_INVALID, OTP_EXPIRED, OTP_LOCKED, OTP_COOLDOWN, SMS_UNAVAILABLE, NOT_ELIGIBLE, CHECK_IN_COOLDOWN, PAYLOAD_TOO_LARGE, UPSTREAM_UNAVAILABLE, CSRF_REJECTED, METHOD_NOT_ALLOWED, INTERNAL]
+            message: { type: string }
+            retryable: { type: boolean }
+            details: {}
+    Lookup:
+      oneOf:
+        - { type: object, required: [method, qr], properties: { method: { const: QR }, qr: { type: string } } }
+        - { type: object, required: [method, memberRef], properties: { method: { const: MEMBER_REF }, memberRef: { type: string, example: HM-7K2M9QP } } }
+        - { type: object, required: [method, hmoOrgId, memberNumber], properties: { method: { const: MEMBER_NUMBER }, hmoOrgId: { type: string, format: uuid }, memberNumber: { type: string } } }
+    ReasonCode:
+      enum: [MEMBER_NOT_FOUND, MEMBER_SUSPENDED, MEMBER_TERMINATED, HMO_SUSPENDED, NO_ACTIVE_COVERAGE, COVERAGE_SUSPENDED, BENEFIT_NOT_IN_PLAN, BENEFIT_NOT_CONFIGURED, MEMBER_GROUP_EXCLUDED, WAITING_PERIOD, OUTSIDE_BENEFIT_PERIOD, PROVIDER_SUSPENDED, PROVIDER_NOT_IN_NETWORK, LOCATION_NOT_APPROVED, PROVIDER_TYPE_NOT_ELIGIBLE, PROVIDER_NOT_ELIGIBLE_FOR_BENEFIT, NO_TARIFF, CURRENCY_MISMATCH, QUANTITY_EXCEEDS_MAX, LIMIT_REACHED, AMOUNT_CAP_REACHED, REFERRAL_REQUIRED, PREAUTHORIZATION_REQUIRED, DATA_STALE, SOURCE_UNAVAILABLE, CHECK_IN_COOLDOWN]
+    EligibilityResponse:
+      type: object
+      properties:
+        member: { type: object, properties: { memberRef: { type: string }, displayName: { type: string, example: "Ada O." }, phoneMasked: { type: string, example: "•••• 4321" } } }
+        hmoName: { type: string }
+        checkedAt: { type: string, format: date-time }
+        durationMs: { type: integer }
+        results:
+          type: array
+          items:
+            type: object
+            properties:
+              eligibilityCheckId: { type: string, format: uuid }
+              benefitId: { type: string, format: uuid }
+              benefitCode: { type: string }
+              benefitName: { type: string }
+              category: { type: string }
+              decision: { enum: [ELIGIBLE, INELIGIBLE, UNVERIFIABLE] }
+              reasons: { type: array, items: { type: object, properties: { code: { $ref: "#/components/schemas/ReasonCode" }, message: { type: string } } } }
+              limits: { type: array, items: { type: object, properties: { metric: { enum: [VISITS, QUANTITY, AMOUNT] }, maximum: { type: integer }, used: { type: integer }, remaining: { type: integer }, windowStart: { type: [string, "null"] }, windowEnd: { type: [string, "null"] } } } }
+              unlimited: { type: boolean }
+              pricing: { type: [object, "null"], properties: { currency: { type: string }, tariffMinor: { type: integer }, quantity: { type: integer }, grossMinor: { type: integer }, copayMinor: { type: integer }, payableMinor: { type: integer } } }
+              confirmation: { enum: [OTP, NONE] }
+              checkIn:
+                type: object
+                properties:
+                  outcome: { enum: [ACCEPTED, DUPLICATE, COOLDOWN, REJECTED] }
+                  cooldownMinutes: { type: integer }
+                  lastCheckInAt: { type: [string, "null"], format: date-time, description: "Server time of the last successful check-in for this benefit (any branch)" }
+                  nextAllowedAt: { type: [string, "null"], format: date-time }
+                  openVisitIntentId: { type: [string, "null"], format: uuid }
+                  existing: { type: [object, "null"], properties: { authorizationReference: { type: string }, authorizedAt: { type: string, format: date-time }, sameBranch: { type: boolean } } }
+    VisitIntent:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        reference: { type: string }
+        status: { enum: [PENDING_CONFIRMATION, CONFIRMED, AUTHORIZED, EXPIRED, CANCELLED] }
+        confirmationMethod: { enum: [OTP, NONE] }
+        expiresAt: { type: string, format: date-time }
+        scanOutcome: { enum: [ACCEPTED, DUPLICATE], description: "Only on POST /v1/visit-intents" }
+        otp:
+          type: [object, "null"]
+          properties:
+            challengeId: { type: string }
+            status: { enum: [PENDING, SENT, SEND_FAILED, VERIFIED, EXPIRED, LOCKED] }
+            expiresAt: { type: string }
+            resendAvailableAt: { type: [string, "null"] }
+            attemptsRemaining: { type: integer }
+            sendsRemaining: { type: integer }
+            phoneMasked: { type: [string, "null"] }
+    AuthorizationResult:
+      type: object
+      properties:
+        replay: { type: boolean }
+        authorization:
+          type: object
+          properties:
+            id: { type: string, format: uuid }
+            reference: { type: string, example: AUTH-7K2M9QPA }
+            status: { enum: [AUTHORIZED, COMPLETED, CANCELLED, EXPIRED] }
+            quantity: { type: integer }
+            currency: { type: string }
+            tariffMinor: { type: integer }
+            copayMinor: { type: integer }
+            payableMinor: { type: integer }
+            authorizedAt: { type: string, format: date-time }
+            expiresAt: { type: string, format: date-time }
+            benefitVersionId: { type: string, format: uuid }
+            planVersionId: { type: string, format: uuid }
+    ClaimStatus:
+      enum: [SUBMITTED, UNDER_REVIEW, APPROVED, REJECTED, DISPUTED, SETTLED]
+    IntegrationInput:
+      type: object
+      required: [hmoOrgId, kind, name]
+      properties:
+        hmoOrgId: { type: string, format: uuid }
+        kind: { enum: [REST_API, WEBHOOK, FHIR, SCHEDULED_FILE] }
+        name: { type: string }
+        status: { enum: [ACTIVE, DISABLED] }
+        config: { type: object, description: "Non-secret settings. REST_API: { baseUrl, memberPath, timeoutMs, realtimeLookup, fieldMap }" }
+        secretRef: { type: string, description: Name of the environment variable holding the secret }
+    Period:
+      oneOf:
+        - { type: object, properties: { type: { const: DAY } } }
+        - { type: object, properties: { type: { const: WEEK }, weekStartsOn: { enum: [MONDAY, TUESDAY, WEDNESDAY, THURSDAY, FRIDAY, SATURDAY, SUNDAY] } } }
+        - { type: object, properties: { type: { const: MONTH } } }
+        - { type: object, properties: { type: { const: YEAR }, anchor: { enum: [CALENDAR, COVERAGE_START] } } }
+        - { type: object, properties: { type: { const: ROLLING_DAYS }, days: { type: integer } } }
+        - { type: object, properties: { type: { const: CUSTOM }, start: { type: string, format: date }, end: { type: string, format: date } } }
+        - { type: object, properties: { type: { const: COVERAGE_TERM } } }
+        - { type: object, properties: { type: { const: LIFETIME } } }
+    BenefitRules:
+      type: object
+      description: "Authoritative schema is BenefitRulesSchema in src/lib/domain/benefit-rules.ts. Either `limits` (≥1) or `unlimited: true`."
+      properties:
+        limits: { type: array, items: { type: object, required: [metric, maximum, period], properties: { metric: { enum: [VISITS, QUANTITY, AMOUNT] }, maximum: { type: integer }, period: { $ref: "#/components/schemas/Period" }, label: { type: string } } } }
+        unlimited: { type: boolean }
+        currency: { type: string, default: NGN }
+        copay: { oneOf: [{ type: object, properties: { type: { const: NONE } } }, { type: object, properties: { type: { const: FIXED }, amountMinor: { type: integer } } }, { type: object, properties: { type: { const: PERCENT }, basisPoints: { type: integer } } }] }
+        waitingPeriodDays: { type: integer }
+        requiresReferral: { type: boolean }
+        requiresPreauthorization: { type: boolean }
+        memberConfirmation: { enum: [OTP, NONE], default: OTP }
+        eligibleProviderTypes: { type: array, items: { type: string } }
+        providerScope: { enum: [APPROVED_NETWORK, SPECIFIC_PROVIDERS] }
+        providerOrgIds: { type: array, items: { type: string, format: uuid } }
+        excludedMemberGroups: { type: array, items: { type: string } }
+        maxQuantityPerVisit: { type: integer, default: 1 }
+        claimEvidence: { type: object, properties: { requireAttendanceConfirmation: { type: boolean }, requireNotes: { type: boolean } } }
+        authorizationValidityMinutes: { type: integer, default: 240 }
+        checkInCooldownMinutes: { type: integer, minimum: 0, maximum: 10080, description: "Minutes between two successful check-ins for this benefit. 0 = none. Absent = platform default CHECK_IN_COOLDOWN_MINUTES (60)." }
+        timezone: { type: string, default: Africa/Lagos }
+      example:
+        limits: [{ metric: VISITS, maximum: 2, period: { type: WEEK, weekStartsOn: MONDAY } }]
+        memberConfirmation: OTP
+        currency: NGN

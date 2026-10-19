@@ -1,0 +1,21 @@
+# Local PostgreSQL for development and tests. Usage: docker compose up -d
+# Published on host port 55432 so it doesn't clash with a PostgreSQL already installed on 5432.
+# To use another port: set HMO_DB_PORT (e.g. in PowerShell: $env:HMO_DB_PORT=55433) and the same port in DATABASE_URL.
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: hmo
+      POSTGRES_PASSWORD: hmo_dev_password
+      POSTGRES_DB: hmo_access_dev
+    ports:
+      - "${HMO_DB_PORT:-55432}:5432"
+    volumes:
+      - hmo_access_pg:/var/lib/postgresql/data
+      - ./docker/init-test-db.sql:/docker-entrypoint-initdb.d/init-test-db.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hmo -d hmo_access_dev"]
+      interval: 3s
+      retries: 20
+volumes:
+  hmo_access_pg:

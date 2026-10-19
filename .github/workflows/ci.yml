@@ -1,0 +1,31 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env: { POSTGRES_USER: hmo, POSTGRES_PASSWORD: hmo_ci_password, POSTGRES_DB: hmo_access_test }
+        ports: ["5432:5432"]
+        options: --health-cmd pg_isready --health-interval 5s --health-retries 10
+    env:
+      NEXT_TELEMETRY_DISABLED: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: npm }
+      - run: npm ci
+      - name: Test environment
+        run: |
+          cat > .env.test <<ENV
+          DATABASE_URL=postgresql://hmo:hmo_ci_password@localhost:5432/hmo_access_test
+          APP_HMAC_SECRET=$(openssl rand -base64 32)
+          FIELD_ENCRYPTION_KEY=$(openssl rand -base64 32)
+          SMS_PROVIDER=dev
+          ENV
+          cp .env.test .env
+      - run: npm audit --audit-level=moderate
+      - run: npm run lint
+      - run: npm test
+      - run: npm run build

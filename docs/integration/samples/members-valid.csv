@@ -1,0 +1,7 @@
+member_number,first_name,last_name,phone,plan_code,coverage_start,coverage_end,status,member_group
+SHD/2026/4101,Chinonso,Okeke,0803 412 5501,CORP-GOLD,2026-01-01,2026-12-31,ACTIVE,Zenith Logistics
+SHD/2026/4102,Aisha,Mohammed,+2348064125502,CORP-GOLD,01/01/2026,31/12/2026,ACTIVE,Zenith Logistics
+SHD/2026/4103,Oluwaseun,Balogun-Ade,08094125503,CORP-SILVER,2026-02-15,,ACTIVE,Harmattan Foods
+SHD/2026/4104,Ifeoma,Nwachukwu,0909 412 5504,CORP-SILVER,2026-02-15,,SUSPENDED,Harmattan Foods
+SHD/2026/4105,Tunde,O'Neal,(0805) 412-5505,CORP-GOLD,2025-01-01,2025-12-31,TERMINATED,
+SHD/2026/4106,Zainab,Abdullahi,2348074125506,CORP-GOLD,2026-03-01,,A,Zenith Logistics

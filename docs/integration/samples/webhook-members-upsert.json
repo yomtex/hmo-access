@@ -1,0 +1,27 @@
+{
+  "eventType": "members.upsert",
+  "members": [
+    {
+      "memberNumber": "SHD/2026/4101",
+      "firstName": "Chinonso",
+      "lastName": "Okeke",
+      "phone": "+2348034125501",
+      "planCode": "CORP-GOLD",
+      "coverageStart": "2026-01-01",
+      "coverageEnd": "2026-12-31",
+      "coverageStatus": "ACTIVE",
+      "memberGroup": "Zenith Logistics"
+    },
+    {
+      "memberNumber": "SHD/2026/4104",
+      "firstName": "Ifeoma",
+      "lastName": "Nwachukwu",
+      "phone": "09094125504",
+      "planCode": "CORP-SILVER",
+      "coverageStart": "2026-02-15",
+      "coverageEnd": null,
+      "coverageStatus": "SUSPENDED",
+      "memberGroup": null
+    }
+  ]
+}

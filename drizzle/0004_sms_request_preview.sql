@@ -1,0 +1,1 @@
+ALTER TABLE "sms_simulations" ADD COLUMN "request_preview" jsonb;
